@@ -5,6 +5,10 @@ from tensorflow.keras.models import load_model
 import base64
 from PIL import Image
 import io
+import os
+import threading
+import av
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 
 # Constants
 IMG_HEIGHT, IMG_WIDTH = 48, 48
@@ -18,7 +22,10 @@ EMOTIONS = {
     6: 'surprise'
 }
 
-# Page config
+RTC_CONFIGURATION = RTCConfiguration(
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+)
+
 st.set_page_config(
     page_title="Facial Emotion Recognition",
     layout="wide"
@@ -30,24 +37,47 @@ st.title("Facial Emotion Recognition")
 @st.cache_resource
 def load_fer_model():
     """Load the FER model once and cache it"""
-    return load_model('fer_final_model.h5')
+
+    if not os.path.exists('fer_final_model.h5'):
+        st.error("Model file 'fer_final_model.h5' not found. Please make sure it's in the same directory as the app.")
+        st.stop()
+        
+    try:
+        return load_model('fer_final_model.h5', compile=False)
+    except ValueError as e:
+        if 'batch_shape' in str(e):
+            st.error("Model incompatibility detected. Try using a newer TensorFlow version.")
+            st.info("Check that your TensorFlow version matches what was used to create the model.")
+            st.stop()
+        else:
+            st.error(f"Error loading model: {e}")
+            st.stop()
 
 @st.cache_resource
 def load_face_cascade():
     """Load the Haar cascade once and cache it"""
-    return cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+    if not os.path.exists(cascade_path):
+        st.error(f"Haar cascade file not found at: {cascade_path}")
+        st.info("Make sure OpenCV is properly installed with Haar cascades.")
+        st.stop()
+    return cv2.CascadeClassifier(cascade_path)
 
-# Load resources
-model = load_fer_model()
-face_cascade = load_face_cascade()
+# resource loading with error catching
+try:
+    model = load_fer_model()
+    face_cascade = load_face_cascade()
+except Exception as e:
+    st.error(f"Failed to load resources: {e}")
+    st.stop()
 
 def preprocess_face(face_img):
     """Preprocess a face image for the model"""
-    # Convert to grayscale if needed
+    # Convert to grayscale
     if len(face_img.shape) == 3 and face_img.shape[2] == 3:
         face_img = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
     
-    # Resize to model input size
+    # Resize to model
     face_img = cv2.resize(face_img, (IMG_WIDTH, IMG_HEIGHT))
     
     # Normalize pixel values
@@ -75,7 +105,7 @@ def process_image(image):
     # Make a copy to draw on
     result_img = image.copy()
     
-    # Convert to grayscale for face detection
+    # Convert to grayscale
     if len(image.shape) == 3:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     else:
@@ -125,75 +155,94 @@ with tab1:
     uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "jpeg", "png"])
     
     if uploaded_file is not None:
-        # Process uploaded image
-        img = np.array(Image.open(uploaded_file))
-        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        
-        # Process image
-        result_img, results = process_image(img)
-        result_img = cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB)
-        
-        # Display results
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.image(result_img, caption="Processed Image", use_column_width=True)
-        
-        with col2:
-            st.subheader("Detected Emotions")
-            if not results:
-                st.info("No faces detected in the image.")
-            else:
-                for i, result in enumerate(results):
-                    st.markdown(f"**Face {i+1}**")
-                    st.markdown(f"- Emotion: {result['emotion']}")
-                    st.markdown(f"- Confidence: {result['confidence']}")
+        try:
+            # Process uploaded image
+            img = np.array(Image.open(uploaded_file))
+            
+            # Convert RGB to BGR for OpenCV processing
+            if len(img.shape) == 3 and img.shape[2] == 3:
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            
+            # Process image
+            result_img, results = process_image(img)
+            
+            # Convert back to RGB for display
+            if len(result_img.shape) == 3 and result_img.shape[2] == 3:
+                result_img = cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB)
+            
+            # Display results
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.image(result_img, caption="Processed Image", use_column_width=True)
+            
+            with col2:
+                st.subheader("Detected Emotions")
+                if not results:
+                    st.info("No faces detected in the image.")
+                else:
+                    for i, result in enumerate(results):
+                        st.markdown(f"**Face {i+1}**")
+                        st.markdown(f"- Emotion: {result['emotion']}")
+                        st.markdown(f"- Confidence: {result['confidence']}")
+        except Exception as e:
+            st.error(f"Error processing image: {e}")
 
 with tab2:
     st.header("Live Webcam")
-    st.warning("Note: Webcam access requires permission from your browser.")
+    st.info("Click 'Start' to begin webcam facial emotion recognition. Make sure to allow camera access when prompted.")
     
-    # Start/stop webcam button
-    run = st.checkbox("Start Webcam")
+    if 'webcam_results' not in st.session_state:
+        st.session_state.webcam_results = []
+
+    results_placeholder = st.empty()
     
-    # Placeholder for webcam feed
-    image_place = st.empty()
-    
-    # Info placeholder for detected emotions
-    info_place = st.empty()
-    
-    if run:
-        # Use streamlit-webrtc for webcam
-        try:
-            cap = cv2.VideoCapture(0)
+    # callback for WebRTC
+    class VideoProcessor:
+        def __init__(self):
+            self.results = []
+            self.frame_lock = threading.Lock()
             
-            while run:
-                success, frame = cap.read()
-                if not success:
-                    st.error("Failed to access webcam")
-                    break
+        def recv(self, frame):
+            img = frame.to_ndarray(format="bgr24")
+            
+            # Process the frame
+            result_img, face_results = process_image(img)
+            
+            # Update the results in a thread-safe way
+            with self.frame_lock:
+                self.results = face_results
                 
-                # Process frame
-                result_img, results = process_image(frame)
-                result_img = cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB)
-                
-                # Update image display
-                image_place.image(result_img, channels="RGB")
-                
-                # Update info display
-                with info_place.container():
-                    st.subheader("Detected Emotions")
-                    if not results:
-                        st.info("No faces detected")
-                    else:
-                        for i, result in enumerate(results):
-                            st.markdown(f"**Face {i+1}**: {result['emotion']} ({result['confidence']})")
-                
-            # Release resources when stopped
-            cap.release()
-        except Exception as e:
-            st.error(f"Error accessing webcam: {e}")
+            # Update session state with latest results
+            st.session_state.webcam_results = face_results
+            
+            # Return the processed frame
+            return av.VideoFrame.from_ndarray(result_img, format="bgr24")
     
+    # Create WebRTC streamer
+    ctx = webrtc_streamer(
+        key="fer-webcam",
+        mode=WebRtcMode.SENDRECV,
+        rtc_configuration=RTC_CONFIGURATION,
+        video_processor_factory=VideoProcessor,
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True,
+    )
+    
+    # Display results
+    if ctx.state.playing:
+        with results_placeholder.container():
+            st.subheader("Detected Emotions")
+            results = st.session_state.webcam_results
+            if not results:
+                st.info("No faces detected yet. Make sure your face is visible to the camera.")
+            else:
+                for i, result in enumerate(results):
+                    st.markdown(f"**Face {i+1}**: {result['emotion']} (Confidence: {result['confidence']})")
+    else:
+        with results_placeholder.container():
+            st.info("Webcam is not active. Click 'Start' to begin face detection.")
+
 st.sidebar.title("About")
 st.sidebar.info(
     """
